@@ -1,29 +1,36 @@
-FROM python:3.10-slim
+# Use a robust Python base (not slim) since we have 16GB RAM 
+# This ensures all C++ build tools for InsightFace are available
+FROM python:3.10
 
-# Optimization flags
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=true \
-    MALLOC_ARENA_MAX=2
-
-WORKDIR /app
-
-# Install ONLY the absolute essentials for OpenCV/InsightFace
+# 1. Install system dependencies for OpenCV and InsightFace
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# 2. Set up a non-root user (Hugging Face Requirement)
+# The user ID must be 1000
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH
 
-# Install dependencies
-RUN pip install --upgrade pip && \
+# 3. Set working directory
+WORKDIR $HOME/app
+
+# 4. Copy and install requirements
+# We use --chown=user to avoid permission denied errors
+COPY --chown=user requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# 5. Copy the rest of the code
+COPY --chown=user . $HOME/app
 
-EXPOSE 8000
+# 6. Expose the Hugging Face default port
+EXPOSE 7860
 
-# One worker is non-negotiable for 512MB RAM
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# 7. Start the engine
+# Note: Hugging Face can handle multiple workers, but 1-2 is best for stability
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]

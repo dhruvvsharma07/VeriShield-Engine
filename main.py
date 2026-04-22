@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="VeriShield_Inference_Engine")
+app = FastAPI(title="VeriShield_Inference_Engine_HF")
 
 # --- 1. RISK CALIBRATION ---
 BIOMETRIC_WEIGHT = 0.65
@@ -20,16 +20,15 @@ STRUCTURAL_WEIGHT = 0.25
 GOV_ID_WEIGHT = 0.10
 APPROVAL_THRESHOLD = 0.75
 
-# --- 2. ENGINE WARM-UP (Initialization) ---
-# Initialize Biometrics with 'buffalo_s' (Small) to save RAM
-app.face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
-# CRITICAL: det_size=(320, 320) cuts memory usage by 4x vs default
-app.face_app.prepare(ctx_id=0, det_size=(320, 320))
+# --- 2. ENGINE INITIALIZATION (Warm Start) ---
+# High-RAM environment allows us to use the Large (L) model for better accuracy
+face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(640, 640)) # Standard resolution for better detection
 
-# Initialize OCR
+# Warm up EasyOCR
 ocr_engine = easyocr.Reader(['en'], gpu=False)
 
-# Initialize YOLO (Roboflow)
+# Warm up YOLO (Roboflow)
 api_key = os.getenv("ROBOFLOW_API_KEY")
 rf = Roboflow(api_key=api_key)
 try:
@@ -38,7 +37,7 @@ try:
     yolo_engine = project.version(1).model
     print("✅ YOLO Engine Loaded")
 except Exception as e:
-    print(f"⚠️ Roboflow Error: {e}. YOLO checks will be skipped.")
+    print(f"⚠️ Roboflow Error: {e}")
     yolo_engine = None
 
 def get_integrity_hash(audit_data: dict) -> str:
@@ -51,37 +50,35 @@ async def verify_identity(id_card: UploadFile = File(...), selfie: UploadFile = 
     start_time = time.time()
     
     try:
-        # Convert uploads to OpenCV format
         id_bytes = await id_card.read()
         selfie_bytes = await selfie.read()
-        
         img_id = cv2.imdecode(np.frombuffer(id_bytes, np.uint8), cv2.IMREAD_COLOR)
         img_selfie = cv2.imdecode(np.frombuffer(selfie_bytes, np.uint8), cv2.IMREAD_COLOR)
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Image Data")
 
-    # PILLAR 1: Biometrics (Using the corrected app.face_app variable)
-    id_faces = app.face_app.get(cv2.cvtColor(img_id, cv2.COLOR_BGR2RGB))
-    selfie_faces = app.face_app.get(cv2.cvtColor(img_selfie, cv2.COLOR_BGR2RGB))
+    # PILLAR 1: Biometrics (Using high-accuracy buffalo_l)
+    id_faces = face_app.get(cv2.cvtColor(img_id, cv2.COLOR_BGR2RGB))
+    selfie_faces = face_app.get(cv2.cvtColor(img_selfie, cv2.COLOR_BGR2RGB))
     
     similarity = 0.0
     face_match = False
     if id_faces and selfie_faces:
         similarity = float(np.dot(id_faces[0].normed_embedding, selfie_faces[0].normed_embedding))
-        face_match = (similarity > 0.45)
+        face_match = (similarity > 0.45) # Industry standard threshold
 
-    # PILLAR 2: Structural (Roboflow)
+    # PILLAR 2: Structural (Anti-Forgery)
     anchors_found = 0
     if yolo_engine:
         yolo_res = yolo_engine.predict(img_id, confidence=40).json()
         anchors_found = len(yolo_res.get("predictions", []))
 
-    # --- PILLAR 3: OCR VALIDATION ---
+    # PILLAR 3: OCR (Compliance Validation)
     ocr_results = ocr_engine.readtext(img_id)
     raw_text_list = [res[1].upper() for res in ocr_results]
     extracted_text = " ".join(raw_text_list)
     
-    # Specific PAN/Aadhaar Logic
+    # Regulatory Keyword Check
     keywords = ["INCOME TAX", "GOVERNMENT OF INDIA", "AADHAAR", "ELECTION COMMISSION", "FATHER'S NAME"]
     is_gov_doc = any(word in extracted_text for word in keywords)
     is_pan = "PERMANENT" in extracted_text or "ACCOUNT NUMBER" in extracted_text
@@ -93,7 +90,7 @@ async def verify_identity(id_card: UploadFile = File(...), selfie: UploadFile = 
     
     trust_score = (bio_score * BIOMETRIC_WEIGHT) + (struct_score * STRUCTURAL_WEIGHT) + (gov_score * GOV_ID_WEIGHT)
     
-    # Approval logic
+    # Final Governance Gate
     is_approved = (trust_score >= APPROVAL_THRESHOLD and face_match and is_gov_doc)
     
     audit_log = {

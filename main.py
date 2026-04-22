@@ -21,9 +21,10 @@ GOV_ID_WEIGHT = 0.10
 APPROVAL_THRESHOLD = 0.75
 
 # --- 2. ENGINE WARM-UP (Initialization) ---
-# Initialize Biometrics
-face_engine = FaceAnalysis(name="buffalo_s", providers=['CPUExecutionProvider'])
-face_engine.prepare(ctx_id=0, det_size=(640, 640))
+# Initialize Biometrics with 'buffalo_s' (Small) to save RAM
+app.face_app = FaceAnalysis(name='buffalo_s', providers=['CPUExecutionProvider'])
+# CRITICAL: det_size=(320, 320) cuts memory usage by 4x vs default
+app.face_app.prepare(ctx_id=0, det_size=(320, 320))
 
 # Initialize OCR
 ocr_engine = easyocr.Reader(['en'], gpu=False)
@@ -33,7 +34,6 @@ api_key = os.getenv("ROBOFLOW_API_KEY")
 rf = Roboflow(api_key=api_key)
 try:
     workspace = rf.workspace()
-    # Ensure "verishield-kyc" matches the ID in your Roboflow URL
     project = workspace.project("verishield-kyc") 
     yolo_engine = project.version(1).model
     print("✅ YOLO Engine Loaded")
@@ -60,9 +60,9 @@ async def verify_identity(id_card: UploadFile = File(...), selfie: UploadFile = 
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid Image Data")
 
-    # PILLAR 1: Biometrics
-    id_faces = face_engine.get(cv2.cvtColor(img_id, cv2.COLOR_BGR2RGB))
-    selfie_faces = face_engine.get(cv2.cvtColor(img_selfie, cv2.COLOR_BGR2RGB))
+    # PILLAR 1: Biometrics (Using the corrected app.face_app variable)
+    id_faces = app.face_app.get(cv2.cvtColor(img_id, cv2.COLOR_BGR2RGB))
+    selfie_faces = app.face_app.get(cv2.cvtColor(img_selfie, cv2.COLOR_BGR2RGB))
     
     similarity = 0.0
     face_match = False
@@ -75,28 +75,25 @@ async def verify_identity(id_card: UploadFile = File(...), selfie: UploadFile = 
     if yolo_engine:
         yolo_res = yolo_engine.predict(img_id, confidence=40).json()
         anchors_found = len(yolo_res.get("predictions", []))
+
     # --- PILLAR 3: OCR VALIDATION ---
     ocr_results = ocr_engine.readtext(img_id)
-    # Join text and clean it for keyword checking
     raw_text_list = [res[1].upper() for res in ocr_results]
     extracted_text = " ".join(raw_text_list)
     
     # Specific PAN/Aadhaar Logic
     keywords = ["INCOME TAX", "GOVERNMENT OF INDIA", "AADHAAR", "ELECTION COMMISSION", "FATHER'S NAME"]
     is_gov_doc = any(word in extracted_text for word in keywords)
-    
-    # Simple Regex-style check for PAN structure (optional but recommended)
-    # Most PAN cards contain the word 'PERMANENT ACCOUNT NUMBER'
     is_pan = "PERMANENT" in extracted_text or "ACCOUNT NUMBER" in extracted_text
 
-    # --- DECISION LOGIC (RBI Strictness) ---
+    # --- DECISION LOGIC ---
     bio_score = 1.0 if face_match else 0.0
     struct_score = min(anchors_found, 5) / 5.0
     gov_score = 1.0 if is_gov_doc else 0.0
     
     trust_score = (bio_score * BIOMETRIC_WEIGHT) + (struct_score * STRUCTURAL_WEIGHT) + (gov_score * GOV_ID_WEIGHT)
     
-    # RBI COMPLIANCE GATE: Reject if Biometrics fail OR if OCR finds no Govt markers
+    # Approval logic
     is_approved = (trust_score >= APPROVAL_THRESHOLD and face_match and is_gov_doc)
     
     audit_log = {
@@ -107,7 +104,7 @@ async def verify_identity(id_card: UploadFile = File(...), selfie: UploadFile = 
         "structural_anchors": anchors_found,
         "is_gov_verified": is_gov_doc,
         "document_type": "PAN/GOV_ID" if is_pan else "UNKNOWN",
-        "extracted_data_preview": raw_text_list[:10], # Send back first 10 strings for UI
+        "extracted_data_preview": raw_text_list[:10],
         "latency_sec": round(time.time() - start_time, 2)
     }
     
